@@ -2,7 +2,9 @@ from importlib import import_module
 
 from parser.parser import parse_code, extract_changed_lines
 from analyzer.static_analyzer import analyze_code
-from ai.reviewer import review_code
+from ai.reviewer import review_code, _load_env_if_present
+
+_load_env_if_present()
 from risk.risk_engine import calculate_risk
 from models.ingest import IngestRequest, IngestResponse
 from models.analysis import AnalyzeFilesRequest, AnalyzeFilesResponse

@@ -337,7 +337,9 @@ def test_api_failure_fallback():
     mock_gemini = MagicMock()
     mock_gemini.models.generate_content.side_effect = Exception("Connection timeout")
 
-    # No groq_client injected -> Groq also skipped
+    mock_groq = MagicMock()
+    mock_groq.chat.completions.create.side_effect = Exception("Groq connection timeout")
+
     static_issues = [
         {
             "file": "vuln.py",
@@ -349,7 +351,12 @@ def test_api_failure_fallback():
         }
     ]
 
-    result = review_code(code="bad()", static_issues=static_issues, client=mock_gemini)
+    result = review_code(
+        code="bad()",
+        static_issues=static_issues,
+        client=mock_gemini,
+        groq_client=mock_groq,
+    )
 
     assert result["fallback_to_static"] is True
     assert result["provider"] == "static"

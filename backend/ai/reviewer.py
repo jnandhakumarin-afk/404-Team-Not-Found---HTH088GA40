@@ -2,6 +2,7 @@ import os
 import json
 import re
 import logging
+from pathlib import Path
 from typing import List, Dict, Any, Optional, Union
 
 try:
@@ -21,9 +22,43 @@ from ai.prompts import SYSTEM_PROMPT, build_review_user_prompt, build_retry_prom
 
 logger = logging.getLogger(__name__)
 
-# Model selection — overridable via environment variables
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
-GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
+# Model defaults — overridable via environment variables
+DEFAULT_GEMINI_MODEL = "gemini-3.5-flash-lite"
+DEFAULT_GROQ_MODEL = "qwen/qwen3.8-27b"
+
+
+_ENV_LOADED = False
+
+
+def _load_env_if_present(force: bool = False) -> None:
+    """Load environment variables from .env if present and not already loaded."""
+    global _ENV_LOADED
+    if _ENV_LOADED and not force:
+        return
+    _ENV_LOADED = True
+    try:
+        from dotenv import load_dotenv
+        here = Path(__file__).resolve().parent.parent  # backend directory
+        root = here.parent
+        load_dotenv(here / ".env")
+        load_dotenv(root / ".env")
+    except ImportError:
+        for env_path in [Path("backend/.env"), Path(".env"), Path("../.env")]:
+            if env_path.exists():
+                try:
+                    for line in env_path.read_text(encoding="utf-8").splitlines():
+                        line = line.strip()
+                        if line and not line.startswith("#") and "=" in line:
+                            k, v = line.split("=", 1)
+                            k, v = k.strip(), v.strip().strip("'\"")
+                            if k and k not in os.environ:
+                                os.environ[k] = v
+                except Exception:
+                    pass
+
+
+# Initial environment load
+_load_env_if_present()
 
 
 # ---------------------------------------------------------------------------
@@ -33,23 +68,49 @@ GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
 def extract_json_from_text(text: str) -> Dict[str, Any]:
     """
     Extract JSON payload from raw LLM text, stripping markdown code fences if present.
+    Robust against markdown code blocks and backticks inside string literals.
     """
     cleaned = text.strip()
-    if "```json" in cleaned:
-        parts = cleaned.split("```json")
-        if len(parts) > 1:
-            block = parts[1].split("```")[0].strip()
-            return json.loads(block)
-    elif "```" in cleaned:
-        parts = cleaned.split("```")
-        if len(parts) > 1:
-            block = parts[1].strip()
-            return json.loads(block)
 
+    # 1. Try direct parsing
+    try:
+        return json.loads(cleaned)
+    except Exception:
+        pass
+
+    # 2. Strip leading/trailing code fence
+    fence_pattern = r"^```(?:json)?\s*(.*?)\s*```$"
+    match = re.search(fence_pattern, cleaned, re.DOTALL)
+    if match:
+        candidate = match.group(1).strip()
+        try:
+            return json.loads(candidate)
+        except Exception:
+            pass
+
+    # 3. Strip simple markdown prefixes/suffixes if present
+    s = cleaned
+    if s.startswith("```json"):
+        s = s[7:]
+    elif s.startswith("```"):
+        s = s[3:]
+    if s.endswith("```"):
+        s = s[:-3]
+    s = s.strip()
+    try:
+        return json.loads(s)
+    except Exception:
+        pass
+
+    # 4. Find the outermost JSON object bounds { ... }
     first_brace = cleaned.find("{")
     last_brace = cleaned.rfind("}")
     if first_brace != -1 and last_brace != -1 and last_brace > first_brace:
-        return json.loads(cleaned[first_brace : last_brace + 1])
+        candidate = cleaned[first_brace : last_brace + 1]
+        try:
+            return json.loads(candidate)
+        except Exception:
+            pass
 
     return json.loads(cleaned)
 
@@ -57,8 +118,9 @@ def extract_json_from_text(text: str) -> Dict[str, Any]:
 def _sanitize_error(msg: str) -> str:
     """
     Scrub all known API key patterns from error strings before they are
-    logged or returned to callers.  Never exposes credentials.
+    logged or returned to callers. Never exposes credentials.
     """
+    msg = re.sub(r"AQ\.[a-zA-Z0-9_\-]+", "[REDACTED_KEY]", msg)
     msg = re.sub(r"AIza[a-zA-Z0-9_\-]{30,}", "[REDACTED_KEY]", msg)
     msg = re.sub(r"gsk_[a-zA-Z0-9_\-]+", "[REDACTED_KEY]", msg)
     msg = re.sub(r"sk-ant-[a-zA-Z0-9_\-]+", "[REDACTED_KEY]", msg)
@@ -68,22 +130,51 @@ def _sanitize_error(msg: str) -> str:
 
 def _call_gemini(client: Any, user_prompt: str) -> str:
     """Invoke the Gemini API and return the raw text response."""
-    response = client.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=user_prompt,
-        config=genai_types.GenerateContentConfig(
-            system_instruction=SYSTEM_PROMPT,
-            temperature=0.0,
-            max_output_tokens=4096,
-        ),
-    )
-    return response.text
+    configured_model = os.environ.get("GEMINI_MODEL", DEFAULT_GEMINI_MODEL)
+    models_to_try = [configured_model]
+    for candidate in ["gemini-3.5-flash-lite", "gemini-3-flash-preview", "gemini-2.5-flash", "gemini-3.6-flash"]:
+        if candidate not in models_to_try:
+            models_to_try.append(candidate)
+
+    last_exc = None
+    for model_name in models_to_try:
+        try:
+            config = None
+            if genai_types is not None:
+                config_kwargs = {
+                    "system_instruction": SYSTEM_PROMPT,
+                    "temperature": 0.0,
+                    "max_output_tokens": 8192,
+                }
+                try:
+                    config = genai_types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                        **config_kwargs,
+                    )
+                except Exception:
+                    config = genai_types.GenerateContentConfig(**config_kwargs)
+
+            response = client.models.generate_content(
+                model=model_name,
+                contents=user_prompt,
+                config=config,
+            )
+            return response.text
+        except Exception as e:
+            last_exc = e
+            err_str = str(e)
+            if not any(k in err_str for k in ("503", "404", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED", "NOT_FOUND")):
+                raise
+    if last_exc:
+        raise last_exc
+    return ""
 
 
 def _call_groq(client: Any, user_prompt: str) -> str:
     """Invoke the Groq API and return the raw text response."""
+    model_name = os.environ.get("GROQ_MODEL", DEFAULT_GROQ_MODEL)
     response = client.chat.completions.create(
-        model=GROQ_MODEL,
+        model=model_name,
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": user_prompt},
@@ -118,7 +209,8 @@ def _try_llm_with_retry(
         safe_msg = _sanitize_error(str(e))
         last_error = f"{type(e).__name__}: {safe_msg}"
         errors.append(f"{provider_name} attempt 1 failed: {last_error}")
-        logger.warning("[%s] attempt 1 failed: %s", provider_name, last_error)
+        logger.warning("%s request failed: %s", provider_name, safe_msg)
+        print(f"{provider_name} request failed: {safe_msg}")
 
     # --- Retry once on failure ---
     if payload is None and last_error is not None:
@@ -131,7 +223,8 @@ def _try_llm_with_retry(
             safe_retry = _sanitize_error(str(retry_e))
             retry_error = f"{type(retry_e).__name__}: {safe_retry}"
             errors.append(f"{provider_name} attempt 2 (retry) failed: {retry_error}")
-            logger.warning("[%s] attempt 2 failed: %s", provider_name, retry_error)
+            logger.warning("%s request failed: %s", provider_name, safe_retry)
+            print(f"{provider_name} request failed: {safe_retry}")
             payload = None
 
     return payload
@@ -337,6 +430,8 @@ def review_code(
     Never exposes API keys in logs or return values.
     Returns a `provider` key: "gemini" | "groq" | "static"
     """
+    _load_env_if_present()
+
     static_raw = static_issues or []
     normalized_static: List[ReviewFinding] = [
         static_finding_to_review_finding(item) for item in static_raw
@@ -372,14 +467,15 @@ def review_code(
     # PROVIDER 1: Google Gemini
     # ==================================================================
     gemini_api_key = os.environ.get("GEMINI_API_KEY")
-
-    # Use injected test client OR build real Gemini client
     gemini_client = client  # `client` param = Gemini client in tests
+
+    gemini_key_detected = "YES" if bool(gemini_api_key or gemini_client) else "NO"
+    logger.info("Gemini key detected: %s", gemini_key_detected)
+    print(f"Gemini key detected: {gemini_key_detected}")
 
     if gemini_client is None:
         if not gemini_api_key:
             errors.append("GEMINI_API_KEY not set — skipping Gemini.")
-            logger.info("GEMINI_API_KEY not set, skipping Gemini provider.")
         elif genai is None:
             errors.append("google-genai SDK not installed — skipping Gemini.")
             logger.warning("google-genai SDK not installed.")
@@ -389,7 +485,8 @@ def review_code(
             except Exception as e:
                 safe = _sanitize_error(str(e))
                 errors.append(f"Gemini client init failed: {type(e).__name__}: {safe}")
-                logger.warning("Gemini client init failed: %s: %s", type(e).__name__, safe)
+                logger.warning("Gemini request failed: %s", safe)
+                print(f"Gemini request failed: {safe}")
                 gemini_client = None
 
     if gemini_client is not None and llm_payload is None:
@@ -408,14 +505,15 @@ def review_code(
     # ==================================================================
     if llm_payload is None:
         groq_api_key = os.environ.get("GROQ_API_KEY")
-
-        # Use injected test client OR build real Groq client
         effective_groq_client = groq_client
+
+        groq_key_detected = "YES" if bool(groq_api_key or effective_groq_client) else "NO"
+        logger.info("Groq key detected: %s", groq_key_detected)
+        print(f"Groq key detected: {groq_key_detected}")
 
         if effective_groq_client is None:
             if not groq_api_key:
                 errors.append("GROQ_API_KEY not set — skipping Groq.")
-                logger.info("GROQ_API_KEY not set, skipping Groq provider.")
             elif Groq is None:
                 errors.append("groq SDK not installed — skipping Groq.")
                 logger.warning("groq SDK not installed.")
@@ -425,7 +523,8 @@ def review_code(
                 except Exception as e:
                     safe = _sanitize_error(str(e))
                     errors.append(f"Groq client init failed: {type(e).__name__}: {safe}")
-                    logger.warning("Groq client init failed: %s: %s", type(e).__name__, safe)
+                    logger.warning("Groq request failed: %s", safe)
+                    print(f"Groq request failed: {safe}")
 
         if effective_groq_client is not None:
             llm_payload = _try_llm_with_retry(
