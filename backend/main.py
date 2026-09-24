@@ -139,6 +139,7 @@ async def review_endpoint(req: ReviewRequest):
         "signal_ratio": eval_metrics["signal_ratio"],
         "actionable_findings": eval_metrics["actionable_findings"],
         "fallback_to_static": review.get("fallback_to_static", False),
+        "provider": review.get("provider", "static"),
         "errors": review.get("errors", []),
     }
 

@@ -360,12 +360,14 @@ else:
             f"{', '.join(truncated_files)}"
         )
 
-    if is_fallback:
-        error_reasons = review_data.get("errors", [])
-        if error_reasons:
-            st.info(f"ℹ️ AI review unavailable ({'; '.join(error_reasons)}) — showing static analysis findings.")
-        else:
-            st.info("ℹ️ AI review unavailable — showing static analysis findings.")
+    provider = review_data.get("provider", "static")
+    if not is_fallback:
+        if provider == "gemini":
+            st.success("✅ AI review powered by Gemini")
+        elif provider == "groq":
+            st.info("ℹ️ AI review powered by Groq fallback")
+    else:
+        st.info("ℹ️ AI review unavailable — showing static analysis findings.")
 
     st.markdown("---")
 

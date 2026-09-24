@@ -1,25 +1,40 @@
 import os
 import json
 import re
+import logging
 from typing import List, Dict, Any, Optional, Union
 
 try:
-    import anthropic
+    from google import genai
+    from google.genai import types as genai_types
 except ImportError:
-    anthropic = None
+    genai = None
+    genai_types = None
+
+try:
+    from groq import Groq
+except ImportError:
+    Groq = None
 
 from models.review import ReviewFinding, LLMReviewPayload, ReviewResponse
 from ai.prompts import SYSTEM_PROMPT, build_review_user_prompt, build_retry_prompt
 
-DEFAULT_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-3-5-sonnet-20241022")
+logger = logging.getLogger(__name__)
 
+# Model selection — overridable via environment variables
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
+GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 def extract_json_from_text(text: str) -> Dict[str, Any]:
     """
     Extract JSON payload from raw LLM text, stripping markdown code fences if present.
     """
     cleaned = text.strip()
-    # Look for ```json ... ```
     if "```json" in cleaned:
         parts = cleaned.split("```json")
         if len(parts) > 1:
@@ -31,7 +46,6 @@ def extract_json_from_text(text: str) -> Dict[str, Any]:
             block = parts[1].strip()
             return json.loads(block)
 
-    # Search for first '{' and last '}'
     first_brace = cleaned.find("{")
     last_brace = cleaned.rfind("}")
     if first_brace != -1 and last_brace != -1 and last_brace > first_brace:
@@ -40,10 +54,97 @@ def extract_json_from_text(text: str) -> Dict[str, Any]:
     return json.loads(cleaned)
 
 
+def _sanitize_error(msg: str) -> str:
+    """
+    Scrub all known API key patterns from error strings before they are
+    logged or returned to callers.  Never exposes credentials.
+    """
+    msg = re.sub(r"AIza[a-zA-Z0-9_\-]{30,}", "[REDACTED_KEY]", msg)
+    msg = re.sub(r"gsk_[a-zA-Z0-9_\-]+", "[REDACTED_KEY]", msg)
+    msg = re.sub(r"sk-ant-[a-zA-Z0-9_\-]+", "[REDACTED_KEY]", msg)
+    msg = re.sub(r"Bearer\s+[a-zA-Z0-9_\-\.]+", "Bearer [REDACTED]", msg)
+    return msg
+
+
+def _call_gemini(client: Any, user_prompt: str) -> str:
+    """Invoke the Gemini API and return the raw text response."""
+    response = client.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=user_prompt,
+        config=genai_types.GenerateContentConfig(
+            system_instruction=SYSTEM_PROMPT,
+            temperature=0.0,
+            max_output_tokens=4096,
+        ),
+    )
+    return response.text
+
+
+def _call_groq(client: Any, user_prompt: str) -> str:
+    """Invoke the Groq API and return the raw text response."""
+    response = client.chat.completions.create(
+        model=GROQ_MODEL,
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt},
+        ],
+        temperature=0.0,
+        max_tokens=4096,
+    )
+    return response.choices[0].message.content
+
+
+def _try_llm_with_retry(
+    call_fn,
+    user_prompt: str,
+    provider_name: str,
+    errors: List[str],
+) -> Optional[LLMReviewPayload]:
+    """
+    Attempt a single LLM call with one automatic retry on parse / validation failure.
+
+    Returns a validated LLMReviewPayload on success, or None on failure.
+    Safe error messages (no API keys) are appended to `errors`.
+    """
+    last_error: Optional[str] = None
+    payload: Optional[LLMReviewPayload] = None
+
+    # --- Attempt 1 ---
+    try:
+        raw_text = call_fn(user_prompt)
+        raw_json = extract_json_from_text(raw_text)
+        payload = LLMReviewPayload.model_validate(raw_json)
+    except Exception as e:
+        safe_msg = _sanitize_error(str(e))
+        last_error = f"{type(e).__name__}: {safe_msg}"
+        errors.append(f"{provider_name} attempt 1 failed: {last_error}")
+        logger.warning("[%s] attempt 1 failed: %s", provider_name, last_error)
+
+    # --- Retry once on failure ---
+    if payload is None and last_error is not None:
+        try:
+            retry_prompt = build_retry_prompt(user_prompt, last_error)
+            raw_text = call_fn(retry_prompt)
+            raw_json = extract_json_from_text(raw_text)
+            payload = LLMReviewPayload.model_validate(raw_json)
+        except Exception as retry_e:
+            safe_retry = _sanitize_error(str(retry_e))
+            retry_error = f"{type(retry_e).__name__}: {safe_retry}"
+            errors.append(f"{provider_name} attempt 2 (retry) failed: {retry_error}")
+            logger.warning("[%s] attempt 2 failed: %s", provider_name, retry_error)
+            payload = None
+
+    return payload
+
+
+# ---------------------------------------------------------------------------
+# Static → ReviewFinding converter  (unchanged from Stage 3)
+# ---------------------------------------------------------------------------
+
 def static_finding_to_review_finding(sf: Union[Dict[str, Any], Any]) -> ReviewFinding:
     """
-    Convert a normalized static finding (from Stage 2) into the required ReviewFinding schema
-    with detailed problem, impact, why_it_happens, and suggested fix details.
+    Convert a normalized static finding (from Stage 2) into the required ReviewFinding
+    schema with detailed problem, impact, why_it_happens, and suggested fix.
     """
     if hasattr(sf, "model_dump"):
         sf_dict = sf.model_dump()
@@ -132,22 +233,26 @@ def static_finding_to_review_finding(sf: Union[Dict[str, Any], Any]) -> ReviewFi
     )
 
 
+# ---------------------------------------------------------------------------
+# Deduplication  (unchanged from Stage 3)
+# ---------------------------------------------------------------------------
+
 def merge_and_deduplicate(
     static_findings: List[ReviewFinding],
-    llm_findings: List[ReviewFinding]
+    llm_findings: List[ReviewFinding],
 ) -> List[ReviewFinding]:
     """
-    Deduplicate findings, treating static findings as ground truth:
+    Deduplicate findings, treating static findings as ground truth.
     - Match LLM findings to static findings by rule_id or (file, line).
     - If matched, keep static source and rule_id, enhancing with AI impact analysis.
     - If LLM-only, ensure source='llm' and rule_id=None with exact code evidence.
     - Preserve all unmatched static findings.
     """
     final_findings: List[ReviewFinding] = []
-    matched_static_keys = set()
+    matched_static_keys: set = set()
 
-    static_by_rule = {}
-    static_by_file_line = {}
+    static_by_rule: Dict = {}
+    static_by_file_line: Dict = {}
     for sf in static_findings:
         if sf.rule_id:
             static_by_rule[(sf.file, sf.rule_id)] = sf
@@ -176,7 +281,7 @@ def merge_and_deduplicate(
                     why_it_happens=lf.why_it_happens if lf.why_it_happens else matched_sf.why_it_happens,
                     explanation=lf.explanation if lf.explanation else matched_sf.explanation,
                     suggested_fix=lf.suggested_fix if lf.suggested_fix else matched_sf.suggested_fix,
-                    confidence="high"
+                    confidence="high",
                 )
                 final_findings.append(merged)
         else:
@@ -193,7 +298,7 @@ def merge_and_deduplicate(
                 why_it_happens=lf.why_it_happens,
                 explanation=lf.explanation,
                 suggested_fix=lf.suggested_fix,
-                confidence=lf.confidence
+                confidence=lf.confidence,
             )
             final_findings.append(llm_clean)
 
@@ -208,73 +313,40 @@ def merge_and_deduplicate(
     return final_findings
 
 
+# ---------------------------------------------------------------------------
+# Main review function — Gemini -> Groq -> Static fallback
+# ---------------------------------------------------------------------------
+
 def review_code(
     code: Optional[str] = None,
     static_issues: Optional[List[Any]] = None,
     files: Optional[List[Dict[str, Any]]] = None,
     diff: Optional[str] = None,
-    client: Optional[Any] = None,
+    client: Optional[Any] = None,        # Gemini client (injectable for testing)
+    groq_client: Optional[Any] = None,   # Groq client (injectable for testing)
 ) -> Dict[str, Any]:
     """
-    Main contextual code review function (Stage 3).
+    Main contextual code review function.
 
-    Accepts code/diff/files and static findings, invokes the Anthropic API
-    with the system review policy, validates output with Pydantic, retries
-    once on failure, and falls back to static findings if unavailable.
+    Tries providers in order:
+      1. Google Gemini (GEMINI_API_KEY)
+      2. Groq          (GROQ_API_KEY)
+      3. Static-only fallback
+
+    Never crashes on API unavailability.
+    Never exposes API keys in logs or return values.
+    Returns a `provider` key: "gemini" | "groq" | "static"
     """
     static_raw = static_issues or []
-    # Convert all raw static issues into normalized ReviewFinding objects
     normalized_static: List[ReviewFinding] = [
         static_finding_to_review_finding(item) for item in static_raw
     ]
 
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
     errors: List[str] = []
 
-    # Fallback if API key is missing
-    if not api_key and client is None:
-        errors.append("ANTHROPIC_API_KEY environment variable is not set. Falling back to static findings.")
-        findings_dicts = [f.model_dump() for f in normalized_static]
-        return {
-            "summary": "Review completed using static analysis findings (LLM unavailable).",
-            "findings": findings_dicts,
-            "total_findings": len(findings_dicts),
-            "issues": findings_dicts,
-            "total_issues": len(findings_dicts),
-            "fallback_to_static": True,
-            "errors": errors,
-        }
-
-    # Initialize Anthropic client if not provided (e.g. for testing)
-    if client is None:
-        if anthropic is None:
-            errors.append("Anthropic SDK is not installed. Falling back to static findings.")
-            findings_dicts = [f.model_dump() for f in normalized_static]
-            return {
-                "summary": "Review completed using static analysis findings (Anthropic SDK not installed).",
-                "findings": findings_dicts,
-                "total_findings": len(findings_dicts),
-                "issues": findings_dicts,
-                "total_issues": len(findings_dicts),
-                "fallback_to_static": True,
-                "errors": errors,
-            }
-        try:
-            client = anthropic.Anthropic(api_key=api_key)
-        except Exception as e:
-            errors.append(f"Failed to initialize Anthropic client: {type(e).__name__}")
-            findings_dicts = [f.model_dump() for f in normalized_static]
-            return {
-                "summary": "Review completed using static analysis findings.",
-                "findings": findings_dicts,
-                "total_findings": len(findings_dicts),
-                "issues": findings_dicts,
-                "total_issues": len(findings_dicts),
-                "fallback_to_static": True,
-                "errors": errors,
-            }
-
-    # Prepare static findings dicts for prompt
+    # ------------------------------------------------------------------
+    # Build user prompt (shared across all providers)
+    # ------------------------------------------------------------------
     static_prompt_data = [
         {
             "file": sf.file,
@@ -290,81 +362,106 @@ def review_code(
         files=files,
         diff=diff,
         code=code,
-        static_findings=static_prompt_data
+        static_findings=static_prompt_data,
     )
 
     llm_payload: Optional[LLMReviewPayload] = None
-    last_error: Optional[str] = None
+    active_provider: str = "static"
 
-    # ATTEMPT 1
-    try:
-        response = client.messages.create(
-            model=DEFAULT_MODEL,
-            max_tokens=4096,
-            temperature=0.0,
-            system=SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": user_prompt}],
+    # ==================================================================
+    # PROVIDER 1: Google Gemini
+    # ==================================================================
+    gemini_api_key = os.environ.get("GEMINI_API_KEY")
+
+    # Use injected test client OR build real Gemini client
+    gemini_client = client  # `client` param = Gemini client in tests
+
+    if gemini_client is None:
+        if not gemini_api_key:
+            errors.append("GEMINI_API_KEY not set — skipping Gemini.")
+            logger.info("GEMINI_API_KEY not set, skipping Gemini provider.")
+        elif genai is None:
+            errors.append("google-genai SDK not installed — skipping Gemini.")
+            logger.warning("google-genai SDK not installed.")
+        else:
+            try:
+                gemini_client = genai.Client(api_key=gemini_api_key)
+            except Exception as e:
+                safe = _sanitize_error(str(e))
+                errors.append(f"Gemini client init failed: {type(e).__name__}: {safe}")
+                logger.warning("Gemini client init failed: %s: %s", type(e).__name__, safe)
+                gemini_client = None
+
+    if gemini_client is not None and llm_payload is None:
+        llm_payload = _try_llm_with_retry(
+            call_fn=lambda prompt: _call_gemini(gemini_client, prompt),
+            user_prompt=user_prompt,
+            provider_name="Gemini",
+            errors=errors,
         )
-        content_text = ""
-        for block in getattr(response, "content", []):
-            if getattr(block, "type", "") == "text":
-                content_text += getattr(block, "text", "")
-            elif isinstance(block, dict) and block.get("type") == "text":
-                content_text += block.get("text", "")
+        if llm_payload is not None:
+            active_provider = "gemini"
+            logger.info("Gemini review succeeded.")
 
-        raw_json = extract_json_from_text(content_text)
-        llm_payload = LLMReviewPayload.model_validate(raw_json)
-    except Exception as e:
-        safe_msg = re.sub(r"sk-ant-[a-zA-Z0-9_\-]+", "[REDACTED_KEY]", str(e))
-        last_error = f"{type(e).__name__}: {safe_msg}"
-        errors.append(f"Anthropic API call attempt 1 failed: {last_error}")
-
-    # RETRY ONCE (ATTEMPT 2) if invalid JSON or validation failed
-    if llm_payload is None and last_error is not None:
-        try:
-            retry_prompt = build_retry_prompt(user_prompt, last_error)
-            retry_response = client.messages.create(
-                model=DEFAULT_MODEL,
-                max_tokens=4096,
-                temperature=0.0,
-                system=SYSTEM_PROMPT,
-                messages=[{"role": "user", "content": retry_prompt}],
-            )
-            content_text = ""
-            for block in getattr(retry_response, "content", []):
-                if getattr(block, "type", "") == "text":
-                    content_text += getattr(block, "text", "")
-                elif isinstance(block, dict) and block.get("type") == "text":
-                    content_text += block.get("text", "")
-
-            raw_json = extract_json_from_text(content_text)
-            llm_payload = LLMReviewPayload.model_validate(raw_json)
-        except Exception as retry_err:
-            safe_retry_msg = re.sub(r"sk-ant-[a-zA-Z0-9_\-]+", "[REDACTED_KEY]", str(retry_err))
-            retry_error_desc = f"{type(retry_err).__name__}: {safe_retry_msg}"
-            errors.append(f"Anthropic API call attempt 2 (retry) failed: {retry_error_desc}")
-            last_error = retry_error_desc
-            llm_payload = None
-
-    # If both attempts failed or API errored, fall back to static findings
+    # ==================================================================
+    # PROVIDER 2: Groq fallback
+    # ==================================================================
     if llm_payload is None:
-        reason_detail = f" ({last_error})" if last_error else ""
-        errors.append(f"LLM review failed{reason_detail}. Returning static analysis findings as fallback.")
+        groq_api_key = os.environ.get("GROQ_API_KEY")
+
+        # Use injected test client OR build real Groq client
+        effective_groq_client = groq_client
+
+        if effective_groq_client is None:
+            if not groq_api_key:
+                errors.append("GROQ_API_KEY not set — skipping Groq.")
+                logger.info("GROQ_API_KEY not set, skipping Groq provider.")
+            elif Groq is None:
+                errors.append("groq SDK not installed — skipping Groq.")
+                logger.warning("groq SDK not installed.")
+            else:
+                try:
+                    effective_groq_client = Groq(api_key=groq_api_key)
+                except Exception as e:
+                    safe = _sanitize_error(str(e))
+                    errors.append(f"Groq client init failed: {type(e).__name__}: {safe}")
+                    logger.warning("Groq client init failed: %s: %s", type(e).__name__, safe)
+
+        if effective_groq_client is not None:
+            llm_payload = _try_llm_with_retry(
+                call_fn=lambda prompt: _call_groq(effective_groq_client, prompt),
+                user_prompt=user_prompt,
+                provider_name="Groq",
+                errors=errors,
+            )
+            if llm_payload is not None:
+                active_provider = "groq"
+                logger.info("Groq review succeeded.")
+
+    # ==================================================================
+    # PROVIDER 3: Static-only fallback
+    # ==================================================================
+    if llm_payload is None:
+        reason_detail = f" ({errors[-1]})" if errors else ""
+        errors.append(f"All AI providers failed{reason_detail}. Returning static analysis findings.")
         findings_dicts = [f.model_dump() for f in normalized_static]
         return {
-            "summary": f"Review completed with static analysis findings (LLM unavailable{reason_detail}).",
+            "summary": "Review completed using static analysis findings (AI providers unavailable).",
             "findings": findings_dicts,
             "total_findings": len(findings_dicts),
             "issues": findings_dicts,
             "total_issues": len(findings_dicts),
             "fallback_to_static": True,
+            "provider": "static",
             "errors": errors,
         }
 
+    # ==================================================================
     # Deduplicate and combine findings
+    # ==================================================================
     combined_findings = merge_and_deduplicate(
         static_findings=normalized_static,
-        llm_findings=llm_payload.findings
+        llm_findings=llm_payload.findings,
     )
     findings_dicts = [f.model_dump() for f in combined_findings]
 
@@ -375,5 +472,6 @@ def review_code(
         "issues": findings_dicts,
         "total_issues": len(findings_dicts),
         "fallback_to_static": False,
+        "provider": active_provider,
         "errors": errors,
     }
