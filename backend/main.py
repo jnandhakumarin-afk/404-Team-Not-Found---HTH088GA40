@@ -75,21 +75,41 @@ def analyze_endpoint(data: dict):
     }
 
 
-# DEDUPLICATED /api/review ENDPOINT
+# CONTEXTUAL AI CODE REVIEW ENDPOINT (STAGE 3)
 @app.post("/api/review")
-def review_endpoint(data: dict):
-    code = data.get("code", "")
-    static_issues = analyze_code(code)
-    review = review_code(
-        code,
-        static_issues
-    )
+async def review_endpoint(data: dict):
+    """
+    Perform contextual code review. Runs static analysis as ground truth,
+    then queries Anthropic API for contextual findings, deduplicates,
+    validates via Pydantic, and returns combined findings with risk.
+    """
+    url = data.get("url")
+    files = data.get("files")
+    code = data.get("code")
+    diff = data.get("diff")
+
+    if url and not files:
+        ingest_res = await ingest_github(url)
+        files = [f.model_dump() if hasattr(f, "model_dump") else f for f in ingest_res.files]
+
+    if files:
+        static_findings, _, _ = analyze_changed_files(files)
+        review = review_code(files=files, static_issues=static_findings, diff=diff)
+    else:
+        code_str = code or ""
+        static_issues = analyze_code(code_str)
+        review = review_code(code=code_str, static_issues=static_issues, diff=diff)
+
     risk = calculate_risk(review["issues"])
     return {
         "summary": review["summary"],
+        "findings": review.get("findings", review["issues"]),
+        "total_findings": review.get("total_findings", len(review["issues"])),
         "issues": review["issues"],
         "total_issues": review["total_issues"],
-        "risk": risk
+        "risk": risk,
+        "fallback_to_static": review.get("fallback_to_static", False),
+        "errors": review.get("errors", []),
     }
 
 
