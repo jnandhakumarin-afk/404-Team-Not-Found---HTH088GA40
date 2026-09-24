@@ -8,6 +8,8 @@ from models.ingest import IngestRequest, IngestResponse
 from models.analysis import AnalyzeFilesRequest, AnalyzeFilesResponse
 from parser.github_ingest import ingest_github
 from analyzer.runner import analyze_changed_files
+from evaluation.evaluator import calculate_metrics, evaluate_against_dataset
+from evaluation.dataset import EVAL_SAMPLES
 
 try:
     FastAPI = getattr(import_module("fastapi"), "FastAPI")
@@ -102,6 +104,14 @@ async def review_endpoint(data: dict):
 
     risk = calculate_risk(review["issues"])
     ordered_findings = risk.get("ordered_findings", review.get("findings", review["issues"]))
+
+    # Stage 5 — evaluation metrics
+    custom_expected = data.get("expected")
+    if custom_expected is not None:
+        eval_metrics = calculate_metrics(ordered_findings, custom_expected)
+    else:
+        eval_metrics = evaluate_against_dataset(ordered_findings)
+
     return {
         "summary": review["summary"],
         "findings": ordered_findings,
@@ -109,6 +119,21 @@ async def review_endpoint(data: dict):
         "issues": ordered_findings,
         "total_issues": len(ordered_findings),
         "risk": risk,
+        "evaluation": {
+            "true_positives": eval_metrics["true_positives"],
+            "false_positives": eval_metrics["false_positives"],
+            "false_negatives": eval_metrics["false_negatives"],
+            "precision": eval_metrics["precision"],
+            "recall": eval_metrics["recall"],
+            "actionable_findings": eval_metrics["actionable_findings"],
+            "total_findings": eval_metrics["total_findings"],
+            "signal_ratio": eval_metrics["signal_ratio"],
+            "signal_ratio_pct": eval_metrics["signal_ratio_pct"],
+        },
+        "precision": eval_metrics["precision"],
+        "recall": eval_metrics["recall"],
+        "signal_ratio": eval_metrics["signal_ratio"],
+        "actionable_findings": eval_metrics["actionable_findings"],
         "fallback_to_static": review.get("fallback_to_static", False),
         "errors": review.get("errors", []),
     }
@@ -137,3 +162,33 @@ def analyze_files_endpoint(req: AnalyzeFilesRequest) -> AnalyzeFilesResponse:
         skipped_files=skipped,
         tool_errors=tool_errors,
     )
+
+
+# STAGE 5 — TEST HARNESS / EVALUATION METRICS ENDPOINT
+@app.post("/api/evaluate")
+def evaluate_endpoint(data: dict):
+    """
+    Evaluate system findings against the hand-tagged ground-truth dataset.
+
+    Accepts:
+      - ``findings``     (list) — system findings to evaluate
+      - ``use_dataset``  (bool) — if True (default), evaluate against the
+                                  built-in EVAL_SAMPLES ground truth
+      - ``expected``     (list) — optional override expected issues list
+
+    Returns precision, recall, signal_ratio, TP/FP/FN counts.
+    """
+    findings = data.get("findings", [])
+    use_dataset = data.get("use_dataset", True)
+    custom_expected = data.get("expected", None)
+
+    if custom_expected is not None:
+        metrics = calculate_metrics(findings, custom_expected)
+    elif use_dataset:
+        metrics = evaluate_against_dataset(findings)
+    else:
+        metrics = calculate_metrics(findings, [])
+
+    # Strip private _tp_items/_fp_items/_fn_items from public response
+    public = {k: v for k, v in metrics.items() if not k.startswith("_")}
+    return public
