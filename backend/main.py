@@ -5,7 +5,9 @@ from analyzer.static_analyzer import analyze_code
 from ai.reviewer import review_code
 from risk.risk_engine import calculate_risk
 from models.ingest import IngestRequest, IngestResponse
+from models.analysis import AnalyzeFilesRequest, AnalyzeFilesResponse
 from parser.github_ingest import ingest_github
+from analyzer.runner import analyze_changed_files
 
 try:
     FastAPI = getattr(import_module("fastapi"), "FastAPI")
@@ -95,3 +97,22 @@ def review_endpoint(data: dict):
 @app.post("/api/ingest", response_model=IngestResponse)
 async def ingest_endpoint(req: IngestRequest) -> IngestResponse:
     return await ingest_github(req.url)
+
+
+# STAGE 2 — STATIC ANALYSIS ENDPOINT
+@app.post("/api/analyze-files", response_model=AnalyzeFilesResponse)
+def analyze_files_endpoint(req: AnalyzeFilesRequest) -> AnalyzeFilesResponse:
+    """
+    Run static analysis over changed files from a Stage 1 /api/ingest response.
+
+    Accepts the ``files`` array directly from the ingest response and returns
+    normalized findings from Ruff, Bandit (Python) and ESLint (JS/TS).
+    This endpoint must be called BEFORE any LLM integration.
+    """
+    findings, skipped, tool_errors = analyze_changed_files(req.files)
+    return AnalyzeFilesResponse(
+        total_findings=len(findings),
+        findings=findings,
+        skipped_files=skipped,
+        tool_errors=tool_errors,
+    )
