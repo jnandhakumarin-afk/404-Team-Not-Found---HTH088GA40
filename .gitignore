@@ -25,3 +25,8 @@ __pycache__/
 .idea/
 .DS_Store
 Thumbs.db
+
+# Scratch / debug files
+nul_scan.txt
+test_tools_runner.py
+
