@@ -101,12 +101,13 @@ async def review_endpoint(data: dict):
         review = review_code(code=code_str, static_issues=static_issues, diff=diff)
 
     risk = calculate_risk(review["issues"])
+    ordered_findings = risk.get("ordered_findings", review.get("findings", review["issues"]))
     return {
         "summary": review["summary"],
-        "findings": review.get("findings", review["issues"]),
-        "total_findings": review.get("total_findings", len(review["issues"])),
-        "issues": review["issues"],
-        "total_issues": review["total_issues"],
+        "findings": ordered_findings,
+        "total_findings": len(ordered_findings),
+        "issues": ordered_findings,
+        "total_issues": len(ordered_findings),
         "risk": risk,
         "fallback_to_static": review.get("fallback_to_static", False),
         "errors": review.get("errors", []),
