@@ -6,6 +6,7 @@ from ai.reviewer import review_code
 from risk.risk_engine import calculate_risk
 from models.ingest import IngestRequest, IngestResponse
 from models.analysis import AnalyzeFilesRequest, AnalyzeFilesResponse
+from models.review import ReviewRequest
 from parser.github_ingest import ingest_github
 from analyzer.runner import analyze_changed_files
 from evaluation.evaluator import calculate_metrics, evaluate_against_dataset
@@ -79,20 +80,22 @@ def analyze_endpoint(data: dict):
 
 # CONTEXTUAL AI CODE REVIEW ENDPOINT (STAGE 3)
 @app.post("/api/review")
-async def review_endpoint(data: dict):
+async def review_endpoint(req: ReviewRequest):
     """
     Perform contextual code review. Runs static analysis as ground truth,
     then queries Anthropic API for contextual findings, deduplicates,
     validates via Pydantic, and returns combined findings with risk.
     """
-    url = data.get("url")
-    files = data.get("files")
-    code = data.get("code")
-    diff = data.get("diff")
+    url = req.url
+    files = req.files
+    code = req.code
+    diff = req.diff
+    truncated_files = []
 
     if url and not files:
         ingest_res = await ingest_github(url)
         files = [f.model_dump() if hasattr(f, "model_dump") else f for f in ingest_res.files]
+        truncated_files = getattr(ingest_res, "truncated_files", [])
 
     if files:
         static_findings, _, _ = analyze_changed_files(files)
@@ -106,7 +109,7 @@ async def review_endpoint(data: dict):
     ordered_findings = risk.get("ordered_findings", review.get("findings", review["issues"]))
 
     # Stage 5 — evaluation metrics
-    custom_expected = data.get("expected")
+    custom_expected = req.expected
     if custom_expected is not None:
         eval_metrics = calculate_metrics(ordered_findings, custom_expected)
     else:
@@ -119,6 +122,7 @@ async def review_endpoint(data: dict):
         "issues": ordered_findings,
         "total_issues": len(ordered_findings),
         "risk": risk,
+        "truncated_files": truncated_files,
         "evaluation": {
             "true_positives": eval_metrics["true_positives"],
             "false_positives": eval_metrics["false_positives"],

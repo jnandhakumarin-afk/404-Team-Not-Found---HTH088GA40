@@ -42,7 +42,8 @@ def extract_json_from_text(text: str) -> Dict[str, Any]:
 
 def static_finding_to_review_finding(sf: Union[Dict[str, Any], Any]) -> ReviewFinding:
     """
-    Convert a normalized static finding (from Stage 2) into the required ReviewFinding schema.
+    Convert a normalized static finding (from Stage 2) into the required ReviewFinding schema
+    with detailed problem, impact, why_it_happens, and suggested fix details.
     """
     if hasattr(sf, "model_dump"):
         sf_dict = sf.model_dump()
@@ -60,7 +61,7 @@ def static_finding_to_review_finding(sf: Union[Dict[str, Any], Any]) -> ReviewFi
     evidence = str(sf_dict.get("evidence") or sf_dict.get("code_snippet") or message)
 
     # Map category
-    if "bandit" in tool or rule_id.startswith("S") or "sec" in rule_id.lower():
+    if "bandit" in tool or rule_id.startswith("S") or "sec" in rule_id.lower() or (tool == "bandit"):
         category = "security"
     elif "perf" in tool or rule_id.startswith("PERF"):
         category = "performance"
@@ -71,6 +72,50 @@ def static_finding_to_review_finding(sf: Union[Dict[str, Any], Any]) -> ReviewFi
 
     confidence = "high" if raw_sev in ("HIGH", "CRITICAL") else "moderate"
 
+    # Deep code-impact analysis defaults based on known rule families
+    problem = message
+    if rule_id in ("B307", "eval") or "eval" in message.lower():
+        problem = "Use of dangerous dynamic eval() on untrusted input"
+        impact = "Critical arbitrary code execution (RCE) allowing attackers to run arbitrary Python code or system commands."
+        why_it_happens = "eval() parses and executes string arguments directly in the Python runtime environment."
+        suggested_fix = "Use ast.literal_eval() for safe literal parsing, or json.loads() for structured data."
+    elif rule_id in ("B602", "B404", "B607") or "shell=true" in message.lower():
+        problem = "Execution of system command via subprocess with shell=True"
+        impact = "High-severity command injection allowing attackers to execute arbitrary system commands via shell metacharacters."
+        why_it_happens = "shell=True invokes an OS shell interpreter which parses characters like ;, &&, |, and ` in arguments."
+        suggested_fix = "Pass command and arguments as a sequence of strings with shell=False: subprocess.run(['cmd', arg1], shell=False)."
+    elif rule_id == "B105" or "hardcoded_password" in message.lower():
+        problem = "Possible hardcoded password or credential token in source code"
+        impact = "Credential exposure leading to unauthorized access, privilege escalation, and credential harvesting."
+        why_it_happens = "Plaintext credentials stored in source code persist in version control history and distribution artifacts."
+        suggested_fix = "Load sensitive secrets from environment variables (os.environ) or a secure secrets manager."
+    elif rule_id == "B006" or "mutable default" in message.lower():
+        problem = "Mutable default argument (list/dict/set) used in function definition"
+        impact = "State leaks across function invocations causing memory leaks and hard-to-diagnose logical bugs."
+        why_it_happens = "Python evaluates default parameter expressions once at definition time, sharing the identical instance across all calls."
+        suggested_fix = "Use None as the default argument value and initialize the collection inside the function."
+    elif rule_id == "E722" or "bare except" in message.lower():
+        problem = "Bare except clause without explicit exception type"
+        impact = "Silently swallows critical system exceptions such as KeyboardInterrupt and SystemExit, masking fatal defects."
+        why_it_happens = "An unqualified 'except:' catches BaseException, intercepting signals and memory errors unintended by the author."
+        suggested_fix = "Catch specific exceptions like 'except Exception as e:' or narrower types like 'except ValueError:'."
+    elif category == "security":
+        impact = "Potential security exposure, vulnerability exploitation, or unauthorized execution risk."
+        why_it_happens = f"Static security rule {rule_id} triggered: {message}"
+        suggested_fix = f"Resolve {rule_id} flagged by {tool or 'static analyzer'}."
+    elif category == "performance":
+        impact = "Performance degradation, increased latency, or excessive resource consumption."
+        why_it_happens = f"Static performance rule {rule_id} triggered: {message}"
+        suggested_fix = f"Optimize code pattern flagged by {rule_id}."
+    elif category == "style":
+        impact = "Code readability and maintainability degradation."
+        why_it_happens = f"Style rule {rule_id} triggered: {message}"
+        suggested_fix = f"Reformat or adjust style according to {rule_id}."
+    else:
+        impact = "Unexpected application behavior, runtime exception, or application instability."
+        why_it_happens = f"Static analysis rule {rule_id} triggered: {message}"
+        suggested_fix = f"Resolve {rule_id} flagged by {tool or 'static analyzer'}."
+
     return ReviewFinding(
         file=file_path,
         line=line,
@@ -78,8 +123,11 @@ def static_finding_to_review_finding(sf: Union[Dict[str, Any], Any]) -> ReviewFi
         source="static",
         rule_id=rule_id,
         evidence=evidence,
+        problem=problem,
+        impact=impact,
+        why_it_happens=why_it_happens,
         explanation=message,
-        suggested_fix=f"Resolve {rule_id} flagged by {tool or 'static analyzer'}.",
+        suggested_fix=suggested_fix,
         confidence=confidence,
     )
 
@@ -91,8 +139,8 @@ def merge_and_deduplicate(
     """
     Deduplicate findings, treating static findings as ground truth:
     - Match LLM findings to static findings by rule_id or (file, line).
-    - If matched, keep static source and rule_id, enhancing explanation if useful.
-    - If LLM-only, ensure source='llm' and rule_id=None.
+    - If matched, keep static source and rule_id, enhancing with AI impact analysis.
+    - If LLM-only, ensure source='llm' and rule_id=None with exact code evidence.
     - Preserve all unmatched static findings.
     """
     final_findings: List[ReviewFinding] = []
@@ -123,6 +171,9 @@ def merge_and_deduplicate(
                     source="static",
                     rule_id=matched_sf.rule_id,
                     evidence=lf.evidence if lf.evidence else matched_sf.evidence,
+                    problem=lf.problem if lf.problem else matched_sf.problem,
+                    impact=lf.impact if lf.impact else matched_sf.impact,
+                    why_it_happens=lf.why_it_happens if lf.why_it_happens else matched_sf.why_it_happens,
                     explanation=lf.explanation if lf.explanation else matched_sf.explanation,
                     suggested_fix=lf.suggested_fix if lf.suggested_fix else matched_sf.suggested_fix,
                     confidence="high"
@@ -137,6 +188,9 @@ def merge_and_deduplicate(
                 source="llm",
                 rule_id=None,
                 evidence=lf.evidence,
+                problem=lf.problem,
+                impact=lf.impact,
+                why_it_happens=lf.why_it_happens,
                 explanation=lf.explanation,
                 suggested_fix=lf.suggested_fix,
                 confidence=lf.confidence
@@ -261,7 +315,9 @@ def review_code(
         raw_json = extract_json_from_text(content_text)
         llm_payload = LLMReviewPayload.model_validate(raw_json)
     except Exception as e:
-        last_error = f"{type(e).__name__}: {str(e)}"
+        safe_msg = re.sub(r"sk-ant-[a-zA-Z0-9_\-]+", "[REDACTED_KEY]", str(e))
+        last_error = f"{type(e).__name__}: {safe_msg}"
+        errors.append(f"Anthropic API call attempt 1 failed: {last_error}")
 
     # RETRY ONCE (ATTEMPT 2) if invalid JSON or validation failed
     if llm_payload is None and last_error is not None:
@@ -284,15 +340,19 @@ def review_code(
             raw_json = extract_json_from_text(content_text)
             llm_payload = LLMReviewPayload.model_validate(raw_json)
         except Exception as retry_err:
-            errors.append(f"Anthropic validation/parsing failed after retry: {type(retry_err).__name__}")
+            safe_retry_msg = re.sub(r"sk-ant-[a-zA-Z0-9_\-]+", "[REDACTED_KEY]", str(retry_err))
+            retry_error_desc = f"{type(retry_err).__name__}: {safe_retry_msg}"
+            errors.append(f"Anthropic API call attempt 2 (retry) failed: {retry_error_desc}")
+            last_error = retry_error_desc
             llm_payload = None
 
     # If both attempts failed or API errored, fall back to static findings
     if llm_payload is None:
-        errors.append("LLM review failed. Returning static analysis findings as fallback.")
+        reason_detail = f" ({last_error})" if last_error else ""
+        errors.append(f"LLM review failed{reason_detail}. Returning static analysis findings as fallback.")
         findings_dicts = [f.model_dump() for f in normalized_static]
         return {
-            "summary": "Review completed with static analysis findings (LLM parsing/validation failed).",
+            "summary": f"Review completed with static analysis findings (LLM unavailable{reason_detail}).",
             "findings": findings_dicts,
             "total_findings": len(findings_dicts),
             "issues": findings_dicts,

@@ -1,20 +1,26 @@
 import json
 from typing import List, Dict, Any, Optional
 
-SYSTEM_PROMPT = """You are a code review assistant.
+SYSTEM_PROMPT = """You are a senior code review and application security expert.
 
-Analyze the provided code changes and static-analysis findings.
+Analyze the provided code changes and static-analysis findings to provide meaningful code-impact analysis, not just superficial bug labels.
 
 Rules:
-1. Report bugs or security issues only when:
+1. Report bugs, security vulnerabilities, or performance defects only when:
    - they match an existing static-analysis finding, OR
-   - there is exact evidence in the changed code.
-2. Static-analysis findings must be explained using source=static and their original rule_id.
+   - there is exact, verifiable code evidence in the changed code/diff.
+2. Static-analysis findings must be enriched with context and marked using source="static" with their original rule_id.
 3. Do not duplicate the same static-analysis finding as an LLM finding.
-4. LLM-only findings must use source=llm and include an exact quoted code snippet in evidence.
-5. Do not flag idiomatic code, formatting, naming, or personal style as bugs.
-6. If uncertain, use a lower category or do not report the issue.
-7. Do not invent code, vulnerabilities, or evidence.
+4. LLM-only findings must use source="llm", set rule_id=null, and MUST include an exact quoted code snippet in "evidence".
+5. For EVERY genuine finding, provide a complete, deep code-impact analysis:
+   - "problem": Clearly explain what is wrong in the code.
+   - "evidence": Exact quoted code snippet from the changed code/file.
+   - "impact": Explain what effect this issue can have on the actual project/application (e.g. security exposure, incorrect application behavior, data corruption/loss, performance degradation, application crash, authentication/authorization risk, reliability problems).
+   - "why_it_happens": Explain the technical reason the code causes the problem.
+   - "suggested_fix": Concrete and practical correction approach, including a small corrected-code example where useful.
+   - "confidence": "high" or "moderate".
+6. Do not flag idiomatic code, formatting, indentation, naming, or personal stylistic preferences.
+7. Do not invent code, vulnerabilities, or ungrounded evidence.
 8. Return ONLY valid JSON matching the required schema."""
 
 
@@ -65,7 +71,7 @@ def build_review_user_prompt(
 ### Expected Output Schema:
 Return ONLY a valid JSON object matching this schema:
 {
-  "summary": "Overall summary of code review findings",
+  "summary": "Overall summary of code review findings and release impact",
   "findings": [
     {
       "file": "path/to/file",
@@ -73,9 +79,11 @@ Return ONLY a valid JSON object matching this schema:
       "category": "security | bug | performance | style",
       "source": "static | llm",
       "rule_id": "rule_id_string_or_null",
+      "problem": "clear explanation of what is wrong in the code",
       "evidence": "exact quoted snippet from the changed code",
-      "explanation": "clear explanation of why this is an issue",
-      "suggested_fix": "concrete recommendation to resolve the issue",
+      "impact": "concrete effect on the application (e.g. security exposure, data loss, crash)",
+      "why_it_happens": "technical reason why the code causes this issue",
+      "suggested_fix": "concrete recommendation and corrected code approach",
       "confidence": "high | moderate"
     }
   ]

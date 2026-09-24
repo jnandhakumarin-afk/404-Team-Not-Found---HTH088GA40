@@ -468,6 +468,47 @@ def test_post_api_review_endpoint():
     print("  PASS  POST /api/review endpoint returns valid schema with fallback")
 
 
+def test_anthropic_code_impact_analysis():
+    print("Testing Anthropic meaningful code-impact analysis...")
+    mock_llm_json = {
+        "summary": "Deep code review completed: 1 critical security flaw detected.",
+        "findings": [
+            {
+                "file": "auth.py",
+                "line": 42,
+                "category": "security",
+                "source": "llm",
+                "rule_id": None,
+                "problem": "Unauthenticated access token verification allows signature bypass",
+                "evidence": "jwt.decode(token, verify=False)",
+                "impact": "Full authentication bypass allowing arbitrary account takeover across the application.",
+                "why_it_happens": "Setting verify=False disables cryptographic signature verification entirely.",
+                "suggested_fix": "Always verify signatures using the configured public key: jwt.decode(token, key=PUBLIC_KEY, algorithms=['RS256']).",
+                "confidence": "high"
+            }
+        ]
+    }
+
+    mock_client = MagicMock()
+    mock_client.messages.create.return_value = _make_mock_anthropic_response(json.dumps(mock_llm_json))
+
+    result = review_code(
+        code="jwt.decode(token, verify=False)",
+        client=mock_client
+    )
+
+    assert result["fallback_to_static"] is False
+    assert result["total_findings"] == 1
+    f = result["findings"][0]
+    assert f["problem"] == "Unauthenticated access token verification allows signature bypass"
+    assert f["evidence"] == "jwt.decode(token, verify=False)"
+    assert "Full authentication bypass" in f["impact"]
+    assert "disables cryptographic signature" in f["why_it_happens"]
+    assert "jwt.decode(token, key=PUBLIC_KEY" in f["suggested_fix"]
+    assert f["confidence"] == "high"
+    print("  PASS  Anthropic code-impact analysis (Problem, Impact, Why, Fix, Evidence) verified")
+
+
 # ----------------------------------------------------------------------
 # Runner
 # ----------------------------------------------------------------------
@@ -475,6 +516,7 @@ if __name__ == "__main__":
     tests = [
         test_missing_api_key,
         test_valid_anthropic_response,
+        test_anthropic_code_impact_analysis,
         test_malformed_json_retry_once,
         test_pydantic_validation_failure_retry,
         test_static_fallback_after_retry_fails,
