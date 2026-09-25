@@ -11,7 +11,33 @@ import streamlit as st
 # ---------------------------------------------------------------------------
 # Backend Configuration
 # ---------------------------------------------------------------------------
-BACKEND_URL = os.environ.get("BACKEND_URL", "http://localhost:8000")
+def get_backend_url() -> str:
+    """Resolve backend URL from Streamlit secrets, env var, local probe, or deployed Render URL."""
+    try:
+        if hasattr(st, "secrets") and "BACKEND_URL" in st.secrets:
+            val = str(st.secrets["BACKEND_URL"]).strip()
+            if val:
+                return val.rstrip("/")
+    except Exception:
+        pass
+
+    env_val = os.environ.get("BACKEND_URL", "").strip()
+    if env_val:
+        return env_val.rstrip("/")
+
+    # Probe local 127.0.0.1:8000
+    try:
+        with httpx.Client(timeout=0.6) as probe:
+            if probe.get("http://127.0.0.1:8000/api/status").status_code == 200:
+                return "http://127.0.0.1:8000"
+    except Exception:
+        pass
+
+    return "https://four04-team-not-found-hth088ga40.onrender.com"
+
+
+BACKEND_URL = get_backend_url()
+
 
 # ---------------------------------------------------------------------------
 # Streamlit Page Configuration
@@ -659,101 +685,134 @@ def st_clean_html(html_str: str) -> None:
 # ---------------------------------------------------------------------------
 # Backend Client Methods
 # ---------------------------------------------------------------------------
+def _get_candidate_backend_urls() -> List[str]:
+    """Get candidate URLs to attempt, ensuring deployed cloud URL is a fallback."""
+    primary = get_backend_url()
+    candidates = [primary]
+    cloud_url = "https://four04-team-not-found-hth088ga40.onrender.com"
+    if cloud_url not in candidates:
+        candidates.append(cloud_url)
+    return candidates
+
+
 def call_backend_review(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """Call POST /api/review on the FastAPI backend."""
-    try:
-        with httpx.Client(timeout=90.0) as client:
-            resp = client.post(f"{BACKEND_URL}/api/review", json=payload)
-            if resp.status_code == 200:
-                return resp.json()
+    """Call POST /api/review on the FastAPI backend with fallback."""
+    urls = _get_candidate_backend_urls()
+    last_err = None
 
-            detail = ""
-            try:
-                body = resp.json()
-                if isinstance(body, dict):
-                    detail = body.get("detail", "")
-            except Exception:
+    for base_url in urls:
+        try:
+            with httpx.Client(timeout=90.0) as client:
+                resp = client.post(f"{base_url}/api/review", json=payload)
+                if resp.status_code == 200:
+                    return resp.json()
+
                 detail = ""
+                try:
+                    body = resp.json()
+                    if isinstance(body, dict):
+                        detail = body.get("detail", "")
+                except Exception:
+                    detail = ""
 
-            if detail:
-                raise ValueError(detail)
-            elif resp.status_code == 400:
-                raise ValueError("Invalid GitHub URL provided.")
-            elif resp.status_code == 401:
-                raise ValueError("GitHub authentication failed. Please check your GitHub token.")
-            elif resp.status_code == 403:
-                raise ValueError("GitHub API rate limit exceeded. Please configure a GitHub token or try again later.")
-            elif resp.status_code == 404:
-                raise ValueError("GitHub repository or PR/commit was not found or is not accessible.")
-            elif resp.status_code == 422:
-                raise ValueError("Could not parse or process the GitHub target.")
-            else:
-                raise RuntimeError(f"Backend returned status {resp.status_code}")
-    except httpx.ConnectError:
-        raise ConnectionError(
-            f"Cannot connect to the backend at {BACKEND_URL}. Ensure the FastAPI server is running on port 8000."
-        )
-    except httpx.TimeoutException:
-        raise TimeoutError("The review request timed out. Please check your network connection.")
+                if detail:
+                    raise ValueError(detail)
+                elif resp.status_code == 400:
+                    raise ValueError("Invalid GitHub URL provided.")
+                elif resp.status_code == 401:
+                    raise ValueError("GitHub authentication failed. Please check your GitHub token.")
+                elif resp.status_code == 403:
+                    raise ValueError("GitHub API rate limit exceeded. Please configure a GitHub token or try again later.")
+                elif resp.status_code == 404:
+                    raise ValueError("GitHub repository or PR/commit was not found or is not accessible.")
+                elif resp.status_code == 422:
+                    raise ValueError("Could not parse or process the GitHub target.")
+                else:
+                    raise RuntimeError(f"Backend returned status {resp.status_code}")
+        except (httpx.ConnectError, httpx.ConnectTimeout) as e:
+            last_err = e
+            continue
+        except Exception:
+            raise
+
+    raise ConnectionError(
+        f"Cannot connect to the backend at {urls[0]}. Ensure the FastAPI server is running or check your connection."
+    )
 
 
 def call_backend_fix(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """Call POST /api/fix on the FastAPI backend."""
-    try:
-        with httpx.Client(timeout=90.0) as client:
-            resp = client.post(f"{BACKEND_URL}/api/fix", json=payload)
-            if resp.status_code == 200:
-                return resp.json()
+    """Call POST /api/fix on the FastAPI backend with fallback."""
+    urls = _get_candidate_backend_urls()
+    for base_url in urls:
+        try:
+            with httpx.Client(timeout=90.0) as client:
+                resp = client.post(f"{base_url}/api/fix", json=payload)
+                if resp.status_code == 200:
+                    return resp.json()
 
-            detail = ""
-            try:
-                body = resp.json()
-                if isinstance(body, dict):
-                    detail = body.get("detail", "")
-            except Exception:
                 detail = ""
+                try:
+                    body = resp.json()
+                    if isinstance(body, dict):
+                        detail = body.get("detail", "")
+                except Exception:
+                    detail = ""
 
-            if detail:
-                raise ValueError(detail)
-            else:
-                raise RuntimeError(f"Backend fix error: HTTP {resp.status_code}")
-    except httpx.ConnectError:
-        raise ConnectionError(
-            f"Cannot connect to the backend at {BACKEND_URL}. Ensure the FastAPI server is running on port 8000."
-        )
-    except httpx.TimeoutException:
-        raise TimeoutError("The AI fix request timed out. Please try again.")
+                if detail:
+                    raise ValueError(detail)
+                else:
+                    raise RuntimeError(f"Backend fix error: HTTP {resp.status_code}")
+        except (httpx.ConnectError, httpx.ConnectTimeout):
+            continue
+        except Exception:
+            raise
+
+    raise ConnectionError(
+        f"Cannot connect to the backend at {urls[0]}. Ensure the FastAPI server is running on port 8000."
+    )
 
 
 def call_backend_github_commit(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """Call POST /api/github/commit on the FastAPI backend."""
-    try:
-        with httpx.Client(timeout=45.0) as client:
-            resp = client.post(f"{BACKEND_URL}/api/github/commit", json=payload)
-            if resp.status_code == 200:
-                return resp.json()
-            err_detail = ""
-            try:
-                err_detail = resp.json().get("detail", resp.text)
-            except Exception:
-                err_detail = resp.text
-            return {"success": False, "error": err_detail or f"HTTP {resp.status_code}"}
-    except Exception as e:
-        return {"success": False, "error": str(e)}
+    """Call POST /api/github/commit on the FastAPI backend with fallback."""
+    urls = _get_candidate_backend_urls()
+    for base_url in urls:
+        try:
+            with httpx.Client(timeout=45.0) as client:
+                resp = client.post(f"{base_url}/api/github/commit", json=payload)
+                if resp.status_code == 200:
+                    return resp.json()
+                err_detail = ""
+                try:
+                    err_detail = resp.json().get("detail", resp.text)
+                except Exception:
+                    err_detail = resp.text
+                return {"success": False, "error": err_detail or f"HTTP {resp.status_code}"}
+        except (httpx.ConnectError, httpx.ConnectTimeout):
+            continue
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    return {"success": False, "error": f"Cannot connect to backend server at {urls[0]}."}
 
 
 def call_backend_evaluate() -> Dict[str, Any]:
-
     """Call POST /api/evaluate on the backend against the built-in dataset."""
-    try:
-        with httpx.Client(timeout=30.0) as client:
-            resp = client.post(f"{BACKEND_URL}/api/evaluate", json={"use_dataset": True})
-            if resp.status_code == 200:
-                return resp.json()
-            else:
-                raise RuntimeError(f"Evaluation failed: {resp.text}")
-    except Exception as e:
-        raise RuntimeError(f"Could not connect to evaluation service: {e}")
+    urls = _get_candidate_backend_urls()
+    for base_url in urls:
+        try:
+            with httpx.Client(timeout=30.0) as client:
+                resp = client.post(f"{base_url}/api/evaluate", json={"use_dataset": True})
+                if resp.status_code == 200:
+                    return resp.json()
+                else:
+                    raise RuntimeError(f"Evaluation failed: {resp.text}")
+        except (httpx.ConnectError, httpx.ConnectTimeout):
+            continue
+        except Exception:
+            raise
+
+    raise RuntimeError(f"Could not connect to evaluation service at {urls[0]}.")
+
 
 
 # ---------------------------------------------------------------------------
