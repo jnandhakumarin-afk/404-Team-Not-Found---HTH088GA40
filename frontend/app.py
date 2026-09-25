@@ -725,7 +725,25 @@ def call_backend_fix(payload: Dict[str, Any]) -> Dict[str, Any]:
         raise TimeoutError("The AI fix request timed out. Please try again.")
 
 
+def call_backend_github_commit(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Call POST /api/github/commit on the FastAPI backend."""
+    try:
+        with httpx.Client(timeout=45.0) as client:
+            resp = client.post(f"{BACKEND_URL}/api/github/commit", json=payload)
+            if resp.status_code == 200:
+                return resp.json()
+            err_detail = ""
+            try:
+                err_detail = resp.json().get("detail", resp.text)
+            except Exception:
+                err_detail = resp.text
+            return {"success": False, "error": err_detail or f"HTTP {resp.status_code}"}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
 def call_backend_evaluate() -> Dict[str, Any]:
+
     """Call POST /api/evaluate on the backend against the built-in dataset."""
     try:
         with httpx.Client(timeout=30.0) as client:
@@ -972,26 +990,25 @@ def render_landing():
         if icon == "→":
             wf_inner += f'<span style="color:{P_["secondary_text"]}; font-size:1.2rem; padding:0 0.2rem;">→</span>'
         else:
-            wf_inner += f"""
-            <div class="landing-workflow-step">
-                <div style="font-size:1.4rem; margin-bottom:0.25rem;">{icon}</div>
-                <div style="font-size:0.82rem; color:{P_['secondary_text']}; line-height:1.2;">{label}</div>
-            </div>"""
+            wf_inner += (
+                f'<div class="landing-workflow-step">'
+                f'<div style="font-size:1.4rem; margin-bottom:0.25rem;">{icon}</div>'
+                f'<div style="font-size:0.82rem; color:{P_["secondary_text"]}; line-height:1.2;">{html.escape(label)}</div>'
+                f'</div>'
+            )
 
-    st.markdown(
-        f"""
-        <div style="margin: 2.5rem auto 1.5rem auto; max-width:850px; text-align:center;">
-            <div style="font-size:0.85rem; font-weight:bold; letter-spacing:1.5px;
-                        color:{P_['secondary_text']}; text-transform:uppercase; margin-bottom:1rem;">
-                HOW IT WORKS
-            </div>
-            <div class="landing-workflow-container">
-                {wf_inner}
-            </div>
+    wf_html = f"""
+    <div style="margin: 2.5rem auto 1.5rem auto; max-width:850px; text-align:center;">
+        <div style="font-size:0.85rem; font-weight:bold; letter-spacing:1.5px; color:{P_['secondary_text']}; text-transform:uppercase; margin-bottom:1rem;">
+            HOW IT WORKS
         </div>
-        """,
-        unsafe_allow_html=True,
-    )
+        <div class="landing-workflow-container">
+            {wf_inner}
+        </div>
+    </div>
+    """
+    st_clean_html(wf_html)
+
 
     # Feature Cards
     st.markdown(
@@ -1802,18 +1819,48 @@ def render_fix_panel(active_fix: Dict[str, Any], P: Dict[str, str], key_suffix: 
     """
     st_clean_html(expl_html)
 
-    # Actions: Apply Fix Locally / Dismiss
-    col_apply, col_dismiss, _ = st.columns([1.8, 1.2, 3])
+    # Actions: Push to GitHub / Apply Locally Only / Dismiss
+    col_gh, col_apply, col_dismiss = st.columns([2.2, 1.8, 1.2])
+    gh_k = f"btn_gh_commit_{key_suffix}" if key_suffix else "btn_gh_commit_now"
     apply_k = f"btn_apply_fix_{key_suffix}" if key_suffix else "btn_apply_fix_now"
     dismiss_k = f"btn_dismiss_fix_{key_suffix}" if key_suffix else "btn_dismiss_fix"
+
+    target_url = st.session_state.get("target_url", "")
+    with col_gh:
+        if st.button("🚀 Push Fix to GitHub", type="primary", key=gh_k, use_container_width=True, disabled=not bool(target_url)):
+            with st.spinner("Pushing fix directly to GitHub repository..."):
+                gh_payload = {
+                    "url": target_url,
+                    "file": req.get("file", ""),
+                    "fixed_code": resp.get("fixed_code", ""),
+                    "original_code": resp.get("original_code") or req.get("evidence", ""),
+                    "line": req.get("line"),
+                    "message": f"fix({req.get('file', '')}): apply AI code fix for {req.get('rule_id') or req.get('category')}",
+                }
+                try:
+                    gh_res = call_backend_github_commit(gh_payload)
+                    if gh_res.get("success"):
+                        apply_fix_and_reanalyze(active_fix)
+                        c_url = gh_res.get("commit_url", "")
+                        st.session_state["fix_success_message"] = (
+                            f"🎉 **Successfully committed to GitHub!** Pushed to branch `{gh_res.get('branch')}`. "
+                            f"{f'[View Commit on GitHub]({c_url})' if c_url else ''}"
+                        )
+                        st.rerun()
+                    else:
+                        st.error(f"GitHub Commit failed: {gh_res.get('error', gh_res.get('message'))}")
+                except Exception as e:
+                    st.error(f"GitHub API error: {e}")
+
     with col_apply:
-        if st.button("✅ Apply Fix Locally", type="primary", key=apply_k, use_container_width=True):
+        if st.button("✅ Apply Locally Only", key=apply_k, use_container_width=True):
             apply_fix_and_reanalyze(active_fix)
             st.rerun()
     with col_dismiss:
         if st.button("✕ Dismiss", key=dismiss_k, use_container_width=True):
             st.session_state["active_fix"] = None
             st.rerun()
+
 
 
 

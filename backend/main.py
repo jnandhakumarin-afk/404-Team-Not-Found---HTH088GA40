@@ -10,11 +10,14 @@ from models.ingest import IngestRequest, IngestResponse
 from models.analysis import AnalyzeFilesRequest, AnalyzeFilesResponse
 from models.review import ReviewRequest
 from models.fix import FixRequest, FixResponse
+from models.github_commit import GitHubCommitRequest, GitHubCommitResponse
 from parser.github_ingest import ingest_github
+from parser.github_committer import commit_fix_to_github
 from analyzer.runner import analyze_changed_files
 from ai.fixer import generate_code_fix
 from evaluation.evaluator import calculate_metrics, evaluate_against_dataset
 from evaluation.dataset import EVAL_SAMPLES
+
 
 try:
     FastAPI = getattr(import_module("fastapi"), "FastAPI")
@@ -223,3 +226,12 @@ def fix_code_endpoint(req: FixRequest) -> FixResponse:
     Attempts primary Gemini model, falls back to Groq, and handles errors safely.
     """
     return generate_code_fix(req)
+
+
+# GITHUB AUTOMATED FIX COMMIT ENDPOINT
+@app.post("/api/github/commit", response_model=GitHubCommitResponse)
+async def github_commit_endpoint(req: GitHubCommitRequest) -> GitHubCommitResponse:
+    """
+    Commit and push an approved AI code fix directly to the target GitHub repository branch.
+    """
+    return await commit_fix_to_github(req)
