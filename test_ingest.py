@@ -170,6 +170,136 @@ if __name__ == "__main__":
     test_invalid_urls()
     test_real_pr_ingest()
     test_real_commit_ingest()
+
+    test_token_header_construction()
+    test_no_github_token()
+    test_invalid_token_error()
+    test_simulated_403_rate_limit()
+    test_simulated_403_forbidden()
+    test_simulated_404()
+    test_public_pr_other_users_repo()
+
     print("\n==========================================")
     print("ALL TESTS PASSED SUCCESSFULLY!")
     print("==========================================")
+
+
+def test_token_header_construction():
+    print("Testing GITHUB_TOKEN header construction...")
+    from parser.github_ingest import get_github_headers
+    orig_token = os.environ.get("GITHUB_TOKEN")
+    os.environ["GITHUB_TOKEN"] = "dummy_token_for_test"
+    headers = get_github_headers()
+    assert headers["Authorization"] == "Bearer dummy_token_for_test"
+    assert headers["Accept"] == "application/vnd.github+json"
+    assert headers["X-GitHub-Api-Version"] == "2022-11-28"
+
+    os.environ["GITHUB_TOKEN"] = "Bearer dummy_token_2"
+    headers = get_github_headers()
+    assert headers["Authorization"] == "Bearer dummy_token_2"
+
+    if orig_token is not None:
+        os.environ["GITHUB_TOKEN"] = orig_token
+    else:
+        os.environ.pop("GITHUB_TOKEN", None)
+    print("  -> PASSED: GITHUB_TOKEN header construction")
+
+
+def test_no_github_token():
+    print("Testing unauthenticated headers when GITHUB_TOKEN is not set...")
+    from parser.github_ingest import get_github_headers
+    orig_token = os.environ.get("GITHUB_TOKEN")
+    os.environ.pop("GITHUB_TOKEN", None)
+    headers = get_github_headers()
+    assert "Authorization" not in headers
+    assert headers["Accept"] == "application/vnd.github+json"
+    if orig_token is not None:
+        os.environ["GITHUB_TOKEN"] = orig_token
+    print("  -> PASSED: No GITHUB_TOKEN allows unauthenticated access")
+
+
+def test_invalid_token_error():
+    print("Testing 401 invalid token handling...")
+    import httpx
+    from fastapi import HTTPException
+    from parser.github_ingest import handle_github_error_response
+    req = httpx.Request("GET", "https://api.github.com/repos/pallets/flask/pulls/1/files")
+    resp_401 = httpx.Response(401, request=req, json={"message": "Bad credentials"})
+    try:
+        handle_github_error_response(resp_401, "pull_request")
+        assert False, "Should have raised HTTPException(401)"
+    except HTTPException as exc:
+        assert exc.status_code == 401
+        assert "GitHub authentication failed" in exc.detail
+        assert "token" in exc.detail.lower()
+    print("  -> PASSED: 401 invalid token returns safe message")
+
+
+def test_simulated_403_rate_limit():
+    print("Testing simulated 403 rate-limit response...")
+    import httpx
+    from fastapi import HTTPException
+    from parser.github_ingest import handle_github_error_response
+    req = httpx.Request("GET", "https://api.github.com/repos/pallets/flask/pulls/1/files")
+    resp_403_rl = httpx.Response(
+        403,
+        request=req,
+        headers={"x-ratelimit-remaining": "0"},
+        json={"message": "API rate limit exceeded for 1.2.3.4"}
+    )
+    try:
+        handle_github_error_response(resp_403_rl, "pull_request")
+        assert False, "Should have raised HTTPException(403)"
+    except HTTPException as exc:
+        assert exc.status_code == 403
+        assert "rate limit exceeded" in exc.detail.lower()
+        assert "configure a github token" in exc.detail.lower()
+    print("  -> PASSED: 403 rate limit returns clear advice")
+
+
+def test_simulated_403_forbidden():
+    print("Testing simulated 403 forbidden access...")
+    import httpx
+    from fastapi import HTTPException
+    from parser.github_ingest import handle_github_error_response
+    req = httpx.Request("GET", "https://api.github.com/repos/pallets/flask/pulls/1/files")
+    resp_403_fb = httpx.Response(
+        403,
+        request=req,
+        headers={"x-ratelimit-remaining": "4000"},
+        json={"message": "Must have admin rights to Repository"}
+    )
+    try:
+        handle_github_error_response(resp_403_fb, "pull_request")
+        assert False, "Should have raised HTTPException(403)"
+    except HTTPException as exc:
+        assert exc.status_code == 403
+        assert "forbidden" in exc.detail.lower()
+    print("  -> PASSED: 403 forbidden distinguishes from rate limit")
+
+
+def test_simulated_404():
+    print("Testing simulated 404 not found response...")
+    import httpx
+    from fastapi import HTTPException
+    from parser.github_ingest import handle_github_error_response
+    req = httpx.Request("GET", "https://api.github.com/repos/pallets/flask/pulls/99999/files")
+    resp_404 = httpx.Response(404, request=req, json={"message": "Not Found"})
+    try:
+        handle_github_error_response(resp_404, "pull_request")
+        assert False, "Should have raised HTTPException(404)"
+    except HTTPException as exc:
+        assert exc.status_code == 404
+        assert "not found" in exc.detail.lower()
+    print("  -> PASSED: 404 returns not found message")
+
+
+def test_public_pr_other_users_repo():
+    print("Testing public PR from another user's public repository...")
+    url = "https://github.com/pallets/flask/pull/6162"
+    resp = client.post("/api/ingest", json={"url": url})
+    assert resp.status_code == 200, f"Failed: {resp.text}"
+    data = resp.json()
+    assert data["repository"] == "pallets/flask"
+    assert data["total_files"] >= 1
+    print(f"  -> PASSED: Successfully fetched {data['total_files']} files from pallets/flask")

@@ -1,5 +1,6 @@
 import os
 import re
+from pathlib import Path
 from typing import Tuple, List, Optional
 import httpx
 from fastapi import HTTPException
@@ -36,6 +37,127 @@ PR_REGEX = re.compile(
 COMMIT_REGEX = re.compile(
     r"^https?://github\.com/(?P<owner>[A-Za-z0-9_.-]+)/(?P<repo>[A-Za-z0-9_.-]+)/commit/(?P<commit_sha>[0-9a-fA-F]+)/?.*$"
 )
+
+
+_ENV_LOADED = False
+
+
+def _load_env_if_present(force: bool = False) -> None:
+    """Safely load .env files if present without raising exceptions."""
+    global _ENV_LOADED
+    if _ENV_LOADED and not force:
+        return
+    _ENV_LOADED = True
+
+    try:
+        from dotenv import load_dotenv
+        here = Path(__file__).resolve().parent.parent  # backend directory
+        root = here.parent
+        load_dotenv(here / ".env")
+        load_dotenv(root / ".env")
+    except Exception:
+        pass
+
+    for env_path in [Path("backend/.env"), Path(".env"), Path("../.env")]:
+        if env_path.exists():
+            try:
+                for line in env_path.read_text(encoding="utf-8").splitlines():
+                    line = line.strip()
+                    if line and not line.startswith("#") and "=" in line:
+                        k, v = line.split("=", 1)
+                        k, v = k.strip(), v.strip().strip("'\"")
+                        if k and k not in os.environ:
+                            os.environ[k] = v
+            except Exception:
+                pass
+
+
+_load_env_if_present()
+
+
+def get_github_headers() -> dict:
+    """
+    Build standard GitHub API request headers.
+    Includes Authorization header with GITHUB_TOKEN if configured.
+    Never exposes or logs the token.
+    """
+    _load_env_if_present()
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "AI-Code-Review-Assistant/1.0",
+    }
+    raw_token = os.environ.get("GITHUB_TOKEN", "").strip()
+    if raw_token:
+        token = raw_token[7:].strip() if raw_token.lower().startswith("bearer ") else raw_token
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+    return headers
+
+
+def handle_github_error_response(response: httpx.Response, source_type: str) -> None:
+    """
+    Inspect GitHub response status code and headers to distinguish between:
+      - 401: Invalid authentication / token
+      - 403: Rate limit exceeded vs. Access forbidden
+      - 404: Repository or PR/commit not found
+      - 422: Unprocessable entity / empty diff
+      - other: Generic API error
+    Never exposes sensitive authentication info or raw internal stack traces.
+    """
+    status = response.status_code
+
+    if status == 401:
+        raise HTTPException(
+            status_code=401,
+            detail="GitHub authentication failed. Please check your GitHub token."
+        )
+
+    if status == 403:
+        remaining = response.headers.get("x-ratelimit-remaining")
+        retry_after = response.headers.get("retry-after")
+        body_text = ""
+        try:
+            payload = response.json()
+            body_text = str(payload.get("message", "")).lower()
+        except Exception:
+            body_text = response.text.lower()
+
+        is_rate_limit = (
+            remaining == "0"
+            or retry_after is not None
+            or "rate limit" in body_text
+            or "secondary rate" in body_text
+        )
+
+        if is_rate_limit:
+            raise HTTPException(
+                status_code=403,
+                detail="GitHub API rate limit exceeded. Please configure a GitHub token or try again later."
+            )
+        else:
+            raise HTTPException(
+                status_code=403,
+                detail="GitHub access was forbidden for this repository or resource."
+            )
+
+    if status == 404:
+        raise HTTPException(
+            status_code=404,
+            detail="GitHub repository or PR/commit was not found or is not accessible."
+        )
+
+    if status == 422:
+        raise HTTPException(
+            status_code=422,
+            detail="GitHub was unable to process this request or the PR diff is empty/too large."
+        )
+
+    if response.is_error:
+        raise HTTPException(
+            status_code=status,
+            detail=f"GitHub API error: {status} - {response.reason_phrase}"
+        )
 
 
 def detect_language(filename: str) -> str:
@@ -93,47 +215,32 @@ def process_patch(raw_patch: Optional[str], additions: int, deletions: int) -> T
     return raw_patch, False, changed_lines
 
 
-async def ingest_github(url: str) -> IngestResponse:
+async def ingest_github(url: str, client: Optional[httpx.AsyncClient] = None) -> IngestResponse:
     """
     Fetch PR or commit metadata and diffs from the GitHub public API.
+    Optionally accepts an httpx.AsyncClient for dependency injection / testing.
     """
     owner, repo, source_type, source_id = parse_github_url(url)
     repository_name = f"{owner}/{repo}"
 
-    headers = {
-        "Accept": "application/vnd.github.v3+json",
-        "User-Agent": "AI-Code-Review-Assistant/1.0",
-    }
+    headers = get_github_headers()
 
-    async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+    if source_type == "pull_request":
+        api_url = f"https://api.github.com/repos/{owner}/{repo}/pulls/{source_id}/files?per_page=100"
+    else:
+        api_url = f"https://api.github.com/repos/{owner}/{repo}/commits/{source_id}"
+
+    if client is not None:
         try:
-            if source_type == "pull_request":
-                api_url = f"https://api.github.com/repos/{owner}/{repo}/pulls/{source_id}/files?per_page=100"
-                response = await client.get(api_url, headers=headers)
-            else:
-                api_url = f"https://api.github.com/repos/{owner}/{repo}/commits/{source_id}"
-                response = await client.get(api_url, headers=headers)
+            response = await client.get(api_url, headers=headers)
         except httpx.RequestError as exc:
             raise HTTPException(
                 status_code=502,
                 detail=f"Network error while connecting to GitHub API: {str(exc)}"
             )
 
-        if response.status_code == 404:
-            raise HTTPException(
-                status_code=404,
-                detail=f"GitHub repository or {source_type.replace('_', ' ')} not found."
-            )
-        elif response.status_code == 403:
-            raise HTTPException(
-                status_code=403,
-                detail="GitHub API rate limit exceeded or access forbidden."
-            )
-        elif response.is_error:
-            raise HTTPException(
-                status_code=response.status_code,
-                detail=f"GitHub API error: {response.status_code} - {response.reason_phrase}"
-            )
+        if response.is_error:
+            handle_github_error_response(response, source_type)
 
         try:
             payload = response.json()
@@ -142,6 +249,26 @@ async def ingest_github(url: str) -> IngestResponse:
                 status_code=502,
                 detail="Malformed response received from GitHub API."
             )
+    else:
+        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as default_client:
+            try:
+                response = await default_client.get(api_url, headers=headers)
+            except httpx.RequestError as exc:
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"Network error while connecting to GitHub API: {str(exc)}"
+                )
+
+            if response.is_error:
+                handle_github_error_response(response, source_type)
+
+            try:
+                payload = response.json()
+            except Exception:
+                raise HTTPException(
+                    status_code=502,
+                    detail="Malformed response received from GitHub API."
+                )
 
     raw_files = payload if source_type == "pull_request" else payload.get("files", [])
     if not isinstance(raw_files, list):
