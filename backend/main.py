@@ -9,8 +9,10 @@ from risk.risk_engine import calculate_risk
 from models.ingest import IngestRequest, IngestResponse
 from models.analysis import AnalyzeFilesRequest, AnalyzeFilesResponse
 from models.review import ReviewRequest
+from models.fix import FixRequest, FixResponse
 from parser.github_ingest import ingest_github
 from analyzer.runner import analyze_changed_files
+from ai.fixer import generate_code_fix
 from evaluation.evaluator import calculate_metrics, evaluate_against_dataset
 from evaluation.dataset import EVAL_SAMPLES
 
@@ -39,11 +41,23 @@ app.add_middleware(
 )
 
 
+@app.get("/")
+def root():
+    return {
+        "service": "AI Code Review & Release-Risk Assistant API",
+        "status": "online",
+        "docs": "/docs",
+        "health": "/health",
+        "status_endpoint": "/api/status"
+    }
+
+
 @app.get("/health")
 def health_check():
     return {
         "status": "success"
     }
+
 
 
 @app.get("/api/status")
@@ -199,3 +213,13 @@ def evaluate_endpoint(data: dict):
     # Strip private _tp_items/_fp_items/_fn_items from public response
     public = {k: v for k, v in metrics.items() if not k.startswith("_")}
     return public
+
+
+# AI CODE FIX ASSISTANT ENDPOINT
+@app.post("/api/fix", response_model=FixResponse)
+def fix_code_endpoint(req: FixRequest) -> FixResponse:
+    """
+    Generate an AI-assisted fix for an eligible code finding.
+    Attempts primary Gemini model, falls back to Groq, and handles errors safely.
+    """
+    return generate_code_fix(req)
